@@ -1,56 +1,15 @@
-# This workflow will build and push a new container image to Amazon ECR,
-# and then will deploy a new task definition to Amazon ECS, when there is a push to the "main" branch.
-#
-# To use this workflow, you will need to complete the following set-up steps:
-#
-# 1. Create an ECR repository to store your images.
-#    For example: `aws ecr create-repository --repository-name my-ecr-repo --region us-east-2`.
-#    Replace the value of the `ECR_REPOSITORY` environment variable in the workflow below with your repository's name.
-#    Replace the value of the `AWS_REGION` environment variable in the workflow below with your repository's region.
-#
-# 2. Create an ECS task definition, an ECS cluster, and an ECS service.
-#    For example, follow the Getting Started guide on the ECS console:
-#      https://us-east-2.console.aws.amazon.com/ecs/home?region=us-east-2#/firstRun
-#    Replace the value of the `ECS_SERVICE` environment variable in the workflow below with the name you set for the Amazon ECS service.
-#    Replace the value of the `ECS_CLUSTER` environment variable in the workflow below with the name you set for the cluster.
-#
-# 3. Store your ECS task definition as a JSON file in your repository.
-#    The format should follow the output of `aws ecs register-task-definition --generate-cli-skeleton`.
-#    Replace the value of the `ECS_TASK_DEFINITION` environment variable in the workflow below with the path to the JSON file.
-#    Replace the value of the `CONTAINER_NAME` environment variable in the workflow below with the name of the container
-#    in the `containerDefinitions` section of the task definition.
-#
-# 4. Store an IAM user access key in GitHub Actions secrets named `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
-#    See the documentation for each action used below for the recommended IAM policies for this IAM user,
-#    and best practices on handling the access key credentials.
-
-name: Deploy to Amazon ECS
+name: Deploy to AWS EC2 with NGINX
 
 on:
   push:
     branches: [ "main" ]
 
-env:
-  AWS_REGION:     eu-north-1           # set this to your preferred AWS region, e.g. us-west-1
-  ECR_REPOSITORY:      myapp1-repo      # set this to your Amazon ECR repository name
-  ECS_SERVICE: myapp-service                 # set this to your Amazon ECS service name
-  ECS_CLUSTER: Devcluster                # set this to your Amazon ECS cluster name
-  ECS_TASK_DEFINITION: "arn:aws:ecs:eu-north-1:116981806331:task-definition/myapp-family:1" # set this to the path to your Amazon ECS task definition
-                                               # file, e.g. .aws/task-definition.json
-  CONTAINER_NAME: myapp-task           # set this to the name of the container in the
-                                               # containerDefinitions section of your task definition
-
-permissions:
-  contents: read
-
 jobs:
   deploy:
-    name: Deploy
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
-    - name: Checkout
+    - name: Checkout code
       uses: actions/checkout@v4
 
     - name: Configure AWS credentials
@@ -58,37 +17,56 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        aws-region: eu-north-1
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-
-    - name: Build, tag, and push image to Amazon ECR
-      id: build-image
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ github.sha }}
+    - name: Create VPC
       run: |
-        # Build a docker container and
-        # push it to ECR so that it can
-        # be deployed to ECS.
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        # Créer un VPC
+        VPC_ID=$(aws ec2 create-vpc --cidr-block 10.1.0.0/16 --query "Vpc.VpcId" --output text)
+        echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
 
-    - name: Fill in the new image ID in the Amazon ECS task definition
-      id: task-def
-      uses: aws-actions/amazon-ecs-render-task-definition@v1
-      with:
-        task-definition: ${{ env.ECS_TASK_DEFINITION }}
-        container-name: ${{ env.CONTAINER_NAME }}
-        image: ${{ steps.build-image.outputs.image }}
+        # Ajouter une Gateway Internet au VPC
+        IGW_ID=$(aws ec2 create-internet-gateway --query "InternetGateway.InternetGatewayId" --output text)
+        aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
 
-    - name: Deploy Amazon ECS task definition
-      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-      with:
-        task-definition: ${{ steps.task-def.outputs.task-definition }}
-        service: ${{ env.ECS_SERVICE }}
-        cluster: ${{ env.ECS_CLUSTER }}
-        wait-for-service-stability: true
+        # Créer une table de routage publique
+        ROUTE_TABLE_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query "RouteTable.RouteTableId" --output text)
+        aws ec2 create-route --route-table-id $ROUTE_TABLE_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+        echo "ROUTE_TABLE_ID=$ROUTE_TABLE_ID" >> $GITHUB_ENV
+
+    - name: Create Subnets
+      run: |
+        # Créer un sous-réseau public
+        PUBLIC_SUBNET_ID=$(aws ec2 create-subnet --vpc-id ${{ env.VPC_ID }} --cidr-block 10.1.104.0/24 --availability-zone eu-north-1a --query "Subnet.SubnetId" --output text)
+        aws ec2 associate-route-table --subnet-id $PUBLIC_SUBNET_ID --route-table-id ${{ env.ROUTE_TABLE_ID }}
+        aws ec2 modify-subnet-attribute --subnet-id $PUBLIC_SUBNET_ID --map-public-ip-on-launch
+        echo "PUBLIC_SUBNET_ID=$PUBLIC_SUBNET_ID" >> $GITHUB_ENV
+
+        # Créer un sous-réseau privé
+        PRIVATE_SUBNET_ID=$(aws ec2 create-subnet --vpc-id ${{ env.VPC_ID }} --cidr-block 10.1.4.0/24 --availability-zone eu-north-1a --query "Subnet.SubnetId" --output text)
+        echo "PRIVATE_SUBNET_ID=$PRIVATE_SUBNET_ID" >> $GITHUB_ENV
+
+    - name: Launch EC2 instance with NGINX
+      run: |
+        # Créer un groupe de sécurité pour permettre les connexions HTTP (port 80) et SSH (port 22)
+        SECURITY_GROUP_ID=$(aws ec2 create-security-group --group-name "nginx-sg" --description "Allow HTTP and SSH" --vpc-id ${{ env.VPC_ID }} --query "GroupId" --output text)
+        aws ec2 authorize-security-group-ingress --group-id $SECURITY_GROUP_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
+        aws ec2 authorize-security-group-ingress --group-id $SECURITY_GROUP_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+
+        # Lancer une instance EC2 Ubuntu dans le sous-réseau public avec NGINX préinstallé
+        INSTANCE_ID=$(aws ec2 run-instances \
+          --image-id ami-06258b3c86f01e8aa \  # Remplacez par l'AMI Ubuntu pour votre région
+          --count 1 \
+          --instance-type t2.micro \
+          --key-name linuxkeypair  # Remplacez par votre clé SSH
+          --security-group-ids $SECURITY_GROUP_ID \
+          --subnet-id ${{ env.PUBLIC_SUBNET_ID }} \
+          --user-data file://nginx-install.sh \
+          --query "Instances[0].InstanceId" --output text)
+        echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+        echo "Instance launched successfully with ID: $INSTANCE_ID"
+
+    - name: Verify EC2 Instance Status
+      run: |
+        # Vérifiez l'état de l'instance EC2
+        aws ec2 describe-instances --instance-ids ${{ env.INSTANCE_ID }} --query "Reservations[0].Instances[0].State.Name"
